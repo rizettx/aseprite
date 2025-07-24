@@ -1,0 +1,126 @@
+name: Build Aseprite for Windows and Create Release
+
+# Этот рабочий процесс запускается, когда вы создаете и отправляете (push) новый Git-тег,
+# имя которого начинается с 'v' (например, v1.0, v1.2.3).
+on:
+  push:
+    tags:
+      - 'v*' # Триггер для тегов, начинающихся с 'v'
+
+jobs:
+  # Первая задача: Сборка Aseprite под Windows
+  build_windows:
+    name: Build Aseprite on Windows
+    runs-on: windows-latest # Используем последнюю версию Windows
+
+    steps:
+      # Шаг 1: Клонирование вашего репозитория Aseprite
+      - name: Checkout Aseprite repository
+        uses: actions/checkout@v4 # Используем последнюю версию action для клонирования
+        with:
+          submodules: 'recursive' # Обязательно для подмодулей Aseprite
+
+      # Шаг 2: Настройка среды разработки MSVC
+      - name: Setup MSVC Developer Environment
+        uses: microsoft/setup-msvc-dev@v1 # Action для настройки MSVC
+        with:
+          arch: x64 # Указываем архитектуру x64
+
+      # Шаг 3: Загрузка и распаковка Skia (зависимость Aseprite)
+      - name: Download and Extract Skia
+        shell: pwsh # Используем PowerShell для выполнения команд
+        run: |
+          # ОБНОВЛЕННАЯ ССЫЛКА НА SKIA:
+          $skia_url = "https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip"
+          $skia_zip = "Skia.zip"
+          $skia_dest = "${{ github.workspace }}/deps/skia"
+          Write-Host "Creating directory: $skia_dest"
+          New-Item -ItemType Directory -Force -Path $skia_dest
+          Write-Host "Downloading Skia from: $skia_url"
+          Invoke-WebRequest -Uri $skia_url -OutFile $skia_zip
+          Write-Host "Extracting Skia to: $skia_dest"
+          Expand-Archive -Path $skia_zip -DestinationPath $skia_dest -Force # Добавил -Force для перезаписи
+
+      # Шаг 4: Конфигурация проекта с помощью CMake и компиляция с Ninja
+      - name: Configure and Build Aseprite
+        shell: pwsh
+        run: |
+          # Создаем каталог для сборки
+          New-Item -ItemType Directory -Force -Path "build"
+          # Запускаем CMake для конфигурации проекта
+          Write-Host "Running CMake configuration..."
+          cmake -B build -G Ninja `
+                -DLAF_BACKEND=skia `
+                -DSKIA_DIR=${{ github.workspace }}/deps/skia `
+                -DSKIA_LIBRARY_DIR=${{ github.workspace }}/deps/skia/out/Release-x64 ` # Убедитесь, что этот путь верен для новой Skia
+                -DCMAKE_BUILD_TYPE=Release
+          # Запускаем Ninja для компиляции
+          Write-Host "Running Ninja build..."
+          cmake --build build --config Release --target aseprite
+
+      # Шаг 5 (ДИАГНОСТИЧЕСКИЙ): Проверка скомпилированных файлов перед архивацией
+      - name: List compiled files in build/bin (Diagnostic Check)
+        shell: pwsh
+        run: |
+          $binPath = "${{ github.workspace }}/build/bin"
+          Write-Host "Checking directory for compiled binaries: $binPath"
+          if (Test-Path $binPath) {
+              Write-Host "Contents of $binPath:"
+              Get-ChildItem -Path $binPath -Recurse | ForEach-Object { Write-Host $_.FullName }
+          } else {
+              Write-Host "Directory '$binPath' does not exist. This is a critical error."
+              exit 1 # Выходим с ошибкой, если папки нет
+          }
+          # Убедимся, что exe-файл aseprite существует
+          if (-not (Test-Path "${{ github.workspace }}/build/bin/aseprite.exe")) {
+              Write-Host "Error: aseprite.exe was not found in '$binPath'."
+              exit 1 # Выходим с ошибкой, если основного exe-файла нет
+          }
+
+
+      # Шаг 6: Архивирование скомпилированных файлов в ZIP-архив
+      - name: Archive build output to ZIP
+        shell: pwsh
+        run: |
+          $sourcePath = "${{ github.workspace }}/build/bin/*"
+          $destinationPath = "aseprite-windows.zip"
+          Write-Host "Archiving '$sourcePath' to '$destinationPath'..."
+          # Убедимся, что целевая папка существует, если нужно
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destinationPath) | Out-Null
+          Compress-Archive -Path $sourcePath -DestinationPath $destinationPath -Force # -Force для перезаписи
+
+      # Шаг 7: Загрузка ZIP-архива как артефакта рабочего процесса
+      # Это делает файл доступным для скачивания со страницы запуска Actions
+      # и для использования в последующих задачах (например, в 'release')
+      - name: Upload compiled artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-windows-build # Имя артефакта
+          path: aseprite-windows.zip # Путь к файлу для загрузки
+
+  # Вторая задача: Создание релиза на GitHub
+  create_github_release:
+    name: Create GitHub Release
+    # Эта задача будет запущена только после успешного завершения задачи 'build_windows'
+    needs: build_windows
+    runs-on: ubuntu-latest # Для создания релиза достаточно Linux-раннера
+    
+    # Необходимые разрешения для создания релиза и загрузки файлов
+    permissions:
+      contents: write # Разрешение на запись содержимого репозитория (для создания релиза)
+
+    steps:
+      # Шаг 1: Загрузка артефакта, созданного в предыдущей задаче 'build_windows'
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: aseprite-windows-build # Имя артефакта должно совпадать с тем, что было загружено
+
+      # Шаг 2: Создание релиза на GitHub и прикрепление к нему ZIP-файла
+      # Этот action автоматически использует имя тега для имени релиза
+      - name: Create Release and Upload Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: aseprite-windows.zip # Путь к файлу, который нужно прикрепить к релизу
+          # draft: true # Раскомментируйте, если хотите создавать релиз как черновик
+          # prerelease: true # Раскомментируйте, если хотите создать prerelease
